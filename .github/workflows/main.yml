@@ -26,7 +26,7 @@ jobs:
         run: |
           # Create the "READY" file to skip the interactive first-time setup sudo prompt
           touch buildtools
-          chmod +x build.sh
+          chmod +x apollo.sh
 
       - name: Execute Build Script (Interactive Bypass)
         run: |
@@ -35,7 +35,7 @@ jobs:
           # y -> Clean Build
           # y -> Build Flashable ZIP
           # The script handles Compiler/KSU/SELinux automatically within the '8' logic
-          printf "y\n7\n3\n2\ny\ny\ny" | ./build.sh
+          printf "y\n7\n3\n2\ny\ny\ny" | ./apollo.sh
 
       - name: Upload Compiled Zips
         uses: actions/upload-artifact@v4
