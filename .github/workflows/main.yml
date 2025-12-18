@@ -35,7 +35,7 @@ jobs:
           # y -> Clean Build
           # y -> Build Flashable ZIP
           # The script handles Compiler/KSU/SELinux automatically within the '8' logic
-          printf "y\n7\n3\n2\ny\ny\ny" | ./apollo.sh
+          printf "7\n3\n2\ny\ny\ny" | ./apollo.sh
 
       - name: Upload Compiled Zips
         uses: actions/upload-artifact@v4
