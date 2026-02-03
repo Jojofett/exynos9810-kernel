@@ -11,8 +11,21 @@ jobs:
       - name: Checkout Kernel Source
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: false  # Keine automatische Submodule-Initialisierung
           fetch-depth: 0
+
+      - name: Fix Submodule Configuration
+        run: |
+          # Repariere .gitmodules falls nötig
+          if [ -f .gitmodules ]; then
+            echo "Checking .gitmodules configuration..."
+            # Stelle sicher, dass .gitmodules korrekt formatiert ist
+            if grep -q 'KernelSU-Next' .gitmodules; then
+              echo "Found KernelSU-Next in .gitmodules, checking URL..."
+              # Falls URL fehlt, füge eine Dummy-URL hinzu oder entferne den Eintrag
+              sed -i '/\[submodule "KernelSU-Next"\]/,/^\[/d' .gitmodules
+            fi
+          fi
 
       - name: Install Build Dependencies
         run: |
