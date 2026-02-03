@@ -11,18 +11,15 @@ jobs:
       - name: Checkout Kernel Source
         uses: actions/checkout@v4
         with:
-          submodules: false  # Keine automatische Submodule-Initialisierung
+          submodules: false
           fetch-depth: 0
 
       - name: Fix Submodule Configuration
         run: |
-          # Repariere .gitmodules falls nötig
           if [ -f .gitmodules ]; then
             echo "Checking .gitmodules configuration..."
-            # Stelle sicher, dass .gitmodules korrekt formatiert ist
             if grep -q 'KernelSU-Next' .gitmodules; then
               echo "Found KernelSU-Next in .gitmodules, checking URL..."
-              # Falls URL fehlt, füge eine Dummy-URL hinzu oder entferne den Eintrag
               sed -i '/\[submodule "KernelSU-Next"\]/,/^\[/d' .gitmodules
             fi
           fi
@@ -37,23 +34,28 @@ jobs:
 
       - name: Download and Extract Clang Toolchain
         run: |
-          # Create the toolchain directory matching the script's CR_TC path
-          mkdir -p $GITHUB_WORKSPACE/toolchain/clang-r522817
+          # Create the compiler directory where apollo.sh expects it (../compiler from the script's location)
+          mkdir -p $GITHUB_WORKSPACE/../compiler
           
           # Download the r522817 toolchain archive
           echo "Downloading Clang r522817..."
           curl -Lo clang.tar.zst https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/llvm-r522817/clang-r522817.tar.gz
           
-          # Extract using unzstd as performed in apollo.sh
+          # Extract using unzstd
           echo "Extracting toolchain..."
-          tar --use-compress-program=unzstd -xf clang.tar.zst -C $GITHUB_WORKSPACE/toolchain/clang-r522817
+          tar --use-compress-program=unzstd -xf clang.tar.zst -C $GITHUB_WORKSPACE/../compiler
+          
+          # Rename the extracted folder to match what apollo.sh expects
+          mv $GITHUB_WORKSPACE/../compiler/clang-r522817 $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817
           
           # Verify binary existence and set permissions
-          if [ -f "$GITHUB_WORKSPACE/toolchain/clang-r522817/bin/ld.lld" ]; then
+          if [ -f "$GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin/ld.lld" ]; then
             echo "Verification Success: ld.lld found."
-            chmod +x $GITHUB_WORKSPACE/toolchain/clang-r522817/bin/*
+            chmod +x $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin/*
           else
             echo "ERROR: ld.lld not found in extracted directory!"
+            echo "Contents of toolchain directory:"
+            ls -la $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin/ || true
             exit 1
           fi
           
@@ -65,16 +67,29 @@ jobs:
           touch buildtools
           chmod +x apollo.sh
 
+      - name: Debug - Check Toolchain Location
+        run: |
+          echo "Current directory: $(pwd)"
+          echo "Checking if toolchain exists at expected location:"
+          if [ -d "../compiler/clang-18.0.1-r522817" ]; then
+            echo "Toolchain found at ../compiler/clang-18.0.1-r522817"
+            ls -la ../compiler/clang-18.0.1-r522817/bin/ | head -20
+          else
+            echo "ERROR: Toolchain not found at ../compiler/clang-18.0.1-r522817"
+            echo "Checking parent directory structure:"
+            ls -la ../
+          fi
+
       - name: Execute Build Script (Interactive Bypass)
         run: |
           # Simulation sequence:
           # 7 -> Build All/ZIP
           # 3 -> Select Clang 18 (uses clang-r522817 folder)
-          # 2 -> Selinux Enforcing
-          # y -> Enable KernelSU
+          # 1 -> Selinux Permissive
+          # n -> KernelSU
           # y -> Clean Build
           # y -> Build Flashable ZIP
-          printf "7\n3\n2\ny\ny\ny" | ./apollo.sh
+          printf "7\n3\n1\ny\ny\ny" | ./apollo.sh
 
       - name: Upload Compiled Zips
         if: always()
