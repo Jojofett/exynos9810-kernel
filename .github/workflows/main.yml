@@ -34,32 +34,49 @@ jobs:
 
       - name: Download and Extract Clang Toolchain
         run: |
-          # Create the compiler directory where apollo.sh expects it (../compiler from the script's location)
+          # Erstelle das Compiler-Verzeichnis, wo apollo.sh es erwartet
           mkdir -p $GITHUB_WORKSPACE/../compiler
           
-          # Download the r522817 toolchain archive
+          # Lade die r522817 Toolchain herunter
           echo "Downloading Clang r522817..."
-          curl -Lo clang.tar.zst https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/llvm-r522817/clang-r522817.tar.gz
+          curl -Lo clang.tar.gz https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/llvm-r522817/clang-r522817.tar.gz
           
-          # Extract using unzstd
+          # Entpacke mit tar (gzip-Format)
           echo "Extracting toolchain..."
-          tar --use-compress-program=unzstd -xf clang.tar.zst -C $GITHUB_WORKSPACE/../compiler
+          tar -xzf clang.tar.gz -C $GITHUB_WORKSPACE/../compiler
           
-          # Rename the extracted folder to match what apollo.sh expects
-          mv $GITHUB_WORKSPACE/../compiler/clang-r522817 $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817
+          # Zeige den Inhalt des Verzeichnisses für Debugging
+          echo "Contents after extraction:"
+          ls -la $GITHUB_WORKSPACE/../compiler/
           
-          # Verify binary existence and set permissions
+          # Überprüfe, ob das erwartete Verzeichnis existiert
+          if [ -d "$GITHUB_WORKSPACE/../compiler/clang-r522817" ]; then
+              # Wenn ja: umbenennen
+              mv $GITHUB_WORKSPACE/../compiler/clang-r522817 $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817
+              echo "Renaming successful: clang-r522817 -> clang-18.0.1-r522817"
+          else
+              # Wenn nicht: erstelle das Verzeichnis und verschiebe alle Dateien
+              echo "clang-r522817 directory not found. Creating it..."
+              mkdir -p $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817
+              # Verschiebe alle Dateien aus compiler/ in das neue Verzeichnis
+              if [ "$(ls -A $GITHUB_WORKSPACE/../compiler)" ]; then
+                  mv $GITHUB_WORKSPACE/../compiler/* $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/ 2>/dev/null || true
+                  echo "Files moved to clang-18.0.1-r522817"
+              fi
+          fi
+          
+          # Überprüfe ob die Binärdateien existieren
           if [ -f "$GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin/ld.lld" ]; then
             echo "Verification Success: ld.lld found."
             chmod +x $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin/*
           else
             echo "ERROR: ld.lld not found in extracted directory!"
             echo "Contents of toolchain directory:"
-            ls -la $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin/ || true
+            find $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817 -type f | head -20
             exit 1
           fi
           
-          rm clang.tar.zst
+          rm clang.tar.gz
 
       - name: Set up Build Environment
         run: |
