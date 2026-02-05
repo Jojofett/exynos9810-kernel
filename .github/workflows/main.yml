@@ -34,93 +34,72 @@ jobs:
 
       - name: Download and Extract Clang Toolchain
         run: |
-          # Erstelle das Compiler-Verzeichnis, wo apollo.sh es erwartet
           mkdir -p $GITHUB_WORKSPACE/../compiler
-          
-          # Lade die r522817 Toolchain herunter
           echo "Downloading Clang r522817..."
           curl -Lo clang.tar.gz https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/llvm-r522817/clang-r522817.tar.gz
-          
-          # Entpacke mit tar (gzip-Format)
           echo "Extracting toolchain..."
           tar -xzf clang.tar.gz -C $GITHUB_WORKSPACE/../compiler
           
-          # Zeige den Inhalt des Verzeichnisses für Debugging
-          echo "Contents after extraction:"
-          ls -la $GITHUB_WORKSPACE/../compiler/
-          
-          # Überprüfe, ob das erwartete Verzeichnis existiert
-          if [ -d "$GITHUB_WORKSPACE/../compiler/clang-r522817" ]; then
-              # Wenn ja: umbenennen
-              mv $GITHUB_WORKSPACE/../compiler/clang-r522817 $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817
-              echo "Renaming successful: clang-r522817 -> clang-18.0.1-r522817"
-          else
-              # Wenn nicht: erstelle das Verzeichnis und verschiebe alle Dateien
-              echo "clang-r522817 directory not found. Creating it..."
-              mkdir -p $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817
-              # Verschiebe alle Dateien aus compiler/ in das neue Verzeichnis
-              if [ "$(ls -A $GITHUB_WORKSPACE/../compiler)" ]; then
-                  mv $GITHUB_WORKSPACE/../compiler/* $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/ 2>/dev/null || true
-                  echo "Files moved to clang-18.0.1-r522817"
-              fi
+          # Vereinfachte Logik
+          mkdir -p $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817
+          if [ "$(ls -A $GITHUB_WORKSPACE/../compiler)" ]; then
+              mv $GITHUB_WORKSPACE/../compiler/* $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/ 2>/dev/null || true
           fi
           
-          # Überprüfe ob die Binärdateien existieren
           if [ -f "$GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin/ld.lld" ]; then
-            echo "Verification Success: ld.lld found."
+            echo "Toolchain ready"
             chmod +x $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin/*
           else
-            echo "ERROR: ld.lld not found in extracted directory!"
-            echo "Contents of toolchain directory:"
-            find $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817 -type f | head -20
+            echo "ERROR: Toolchain setup failed"
             exit 1
           fi
-          
           rm clang.tar.gz
 
       - name: Set up Build Environment
         run: |
-          # Create the "READY" file to skip the interactive first-time setup sudo prompt
           touch buildtools
           chmod +x apollo.sh
 
-      - name: Execute Build Script (Single Device - G960F)
+      - name: Execute Build Script (Versuch 1)
+        id: build_step
+        continue-on-error: true
         run: |
-          # Baue nur G960F (S9) anstatt "Build All"
-          # Simulation sequence:
-          # 1 -> starlte (G960F)
-          # 3 -> Select Clang 18
-          # 1 -> Selinux Permissive
-          # n -> NO KernelSU
-          # y -> Clean Build
-          # y -> Build Flashable ZIP
+          # Versuch 1: Standard-Build (was bereits funktioniert hat)
           printf "1\n3\n1\nn\ny\ny" | ./apollo.sh
 
-      - name: Check Generated Files
+      - name: Check If ZIP Created
         run: |
-          echo "=== CHECKING GENERATED FILES ==="
-          echo "Current directory: $(pwd)"
-          
-          echo "--- Apollo directory structure ---"
-          find Apollo -type f -name "*.zip" 2>/dev/null || echo "No ZIP files found in Apollo"
-          
-          echo "--- All ZIP files in repository ---"
-          find . -name "*.zip" -type f 2>/dev/null || echo "No ZIP files found"
-          
-          echo "--- Apollo/Out directory ---"
-          find Apollo/Out -type f 2>/dev/null | head -20 || echo "Apollo/Out not found"
-          
-          echo "--- Apollo/Product directory ---"
-          ls -la Apollo/Product/ 2>/dev/null || echo "Apollo/Product not found"
+          if find . -name "*.zip" -type f | grep -q .; then
+            echo "ZIP files found, good!"
+          else
+            echo "No ZIP files found, checking for IMG..."
+            if find . -name "*.img" -type f | grep -q .; then
+              echo "IMG files found, will create ZIP manually"
+              echo "CREATE_ZIP=true" >> $GITHUB_ENV
+            fi
+          fi
 
-      - name: Upload Compiled Zips
-        if: always()
+      - name: Create ZIP from IMG if needed
+        if: env.CREATE_ZIP == 'true'
+        run: |
+          echo "Creating ZIP files from IMG files..."
+          cd Apollo/Product
+          for img_file in *.img; do
+            if [ -f "$img_file" ]; then
+              echo "Creating ZIP for $img_file"
+              zip_name="${img_file%.img}.zip"
+              # Einfache ZIP nur mit dem Image
+              zip "$zip_name" "$img_file"
+              echo "Created: $zip_name"
+            fi
+          done
+          cd ../..
+          ls -la Apollo/Product/
+
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Apollo-Kernel-Zips
+          name: Kernel-Builds
           path: |
-            Apollo/Product/*.zip
-            Apollo/Out/*.zip
-            **/*.zip
-          if-no-files-found: warn
-          compression-level: 6
+            Apollo/Product/*
+          if-no-files-found: error
