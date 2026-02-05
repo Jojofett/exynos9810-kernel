@@ -84,45 +84,43 @@ jobs:
           touch buildtools
           chmod +x apollo.sh
 
-      - name: Execute Build Script (Interactive Bypass)
+      - name: Execute Build Script (Single Device - G960F)
         run: |
+          # Baue nur G960F (S9) anstatt "Build All"
           # Simulation sequence:
-          # 7 -> Build All/ZIP
-          # 3 -> Select Clang 18 (uses clang-r522817 folder)
+          # 1 -> starlte (G960F)
+          # 3 -> Select Clang 18
           # 1 -> Selinux Permissive
           # n -> NO KernelSU
           # y -> Clean Build
           # y -> Build Flashable ZIP
-          printf "7\n3\n1\nn\ny\ny" | ./apollo.sh
+          printf "1\n3\n1\nn\ny\ny" | ./apollo.sh
 
       - name: Check Generated Files
         run: |
           echo "=== CHECKING GENERATED FILES ==="
           echo "Current directory: $(pwd)"
-          echo "Directory structure:"
-          ls -la
           
-          echo "--- Apollo directory ---"
-          ls -la Apollo/ || echo "Apollo directory not found"
-          
-          echo "--- Apollo/Product directory ---"
-          ls -la Apollo/Product/ || echo "Apollo/Product directory not found"
+          echo "--- Apollo directory structure ---"
+          find Apollo -type f -name "*.zip" 2>/dev/null || echo "No ZIP files found in Apollo"
           
           echo "--- All ZIP files in repository ---"
-          find . -name "*.zip" -type f 2>/dev/null
+          find . -name "*.zip" -type f 2>/dev/null || echo "No ZIP files found"
           
-          echo "--- Build output directory contents ---"
-          ls -la arch/arm64/boot/ || echo "arch/arm64/boot/ not found"
+          echo "--- Apollo/Out directory ---"
+          find Apollo/Out -type f 2>/dev/null | head -20 || echo "Apollo/Out not found"
+          
+          echo "--- Apollo/Product directory ---"
+          ls -la Apollo/Product/ 2>/dev/null || echo "Apollo/Product not found"
 
       - name: Upload Compiled Zips
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Apollo-Kernel-Zips
-          # Suche nach ZIP-Dateien in verschiedenen möglichen Pfaden
           path: |
             Apollo/Product/*.zip
-            *.zip
+            Apollo/Out/*.zip
             **/*.zip
           if-no-files-found: warn
           compression-level: 6
