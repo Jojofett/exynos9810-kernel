@@ -645,7 +645,7 @@ void kdp_init(void)
     cred.bp_task_cred       = 0;\
     cred.type_cred          = 0;\
     cred.security_cred      = offsetof(struct cred,security);\
-    cred.usage_cred         = 0;' init/main.c
+    cred.usage_cred         = 0; \
 		
 	cred.cred_task  	= offsetof(struct task_struct,cred);
 	cred.mm_task 		= offsetof(struct task_struct,mm);
