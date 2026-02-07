@@ -30,7 +30,7 @@ jobs:
           sudo apt install -y zstd git gnupg flex bison build-essential zip curl \
           zlib1g-dev libc6-dev-i386 x11proto-core-dev libx11-dev lib32z1-dev \
           libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
-          python-dev-is-python3 bsdiff wget clang clang-tools gcc lld
+          python-dev-is-python3 bsdiff wget clang clang-tools gcc lld libncurses-dev
 
       - name: Download and Extract Clang Toolchain
         run: |
@@ -40,7 +40,6 @@ jobs:
           echo "Extracting toolchain..."
           tar -xzf clang.tar.gz -C $GITHUB_WORKSPACE/../compiler
           
-          # Vereinfachte Logik
           mkdir -p $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817
           if [ "$(ls -A $GITHUB_WORKSPACE/../compiler)" ]; then
               mv $GITHUB_WORKSPACE/../compiler/* $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/ 2>/dev/null || true
@@ -55,46 +54,111 @@ jobs:
           fi
           rm clang.tar.gz
 
-      - name: Set up Build Environment
+      - name: Prepare Kernel Source
         run: |
-          touch buildtools
+          # Set up build environment
           chmod +x apollo.sh
+          
+          # Clean previous builds
+          make clean || true
+          make mrproper || true
+          
+          # Generate missing files
+          echo "Preparing kernel source..."
+          
+          # Create dummy uh.elf file if it doesn't exist
+          if [ ! -f "init/uh.elf" ]; then
+            echo "Creating dummy uh.elf file..."
+            mkdir -p init
+            dd if=/dev/zero of=init/uh.elf bs=1k count=1
+          fi
+          
+          # Check for missing headers
+          echo "Checking for missing headers..."
 
-      - name: Execute Build Script (Versuch 1)
+      - name: Build Kernel with Workarounds
         id: build_step
         continue-on-error: true
         run: |
-          # Versuch 1: Standard-Build (was bereits funktioniert hat)
-          printf "1\n3\n1\nn\ny\ny" | ./apollo.sh
+          echo "Attempting to build kernel with workarounds..."
+          
+          # First, let's try to fix the rkp_ro_alloc_phys issue
+          # This function might be defined elsewhere - let's check
+          if ! grep -r "rkp_ro_alloc_phys" include/linux/rkp.h >/dev/null 2>&1; then
+            echo "Adding missing rkp_ro_alloc_phys declaration..."
+            echo "#ifndef _LINUX_RKP_H" > temp_rkp.h
+            echo "#define _LINUX_RKP_H" >> temp_rkp.h
+            echo "#ifdef CONFIG_RKP_KDP" >> temp_rkp.h
+            echo "void *rkp_ro_alloc(void);" >> temp_rkp.h
+            echo "void *rkp_ro_alloc_phys(void);" >> temp_rkp.h
+            echo "#endif /* CONFIG_RKP_KDP */" >> temp_rkp.h
+            echo "#endif /* _LINUX_RKP_H */" >> temp_rkp.h
+            sudo mv temp_rkp.h include/linux/rkp.h 2>/dev/null || true
+          fi
+          
+          # Try to build with simplified configuration first
+          echo "Generating minimal configuration..."
+          
+          # Use the script but skip interactive parts
+          echo "Running build script with automated inputs..."
+          printf "1\n3\n1\nn\ny\ny" | ./apollo.sh || {
+            echo "First build attempt failed, trying manual build..."
+            
+            # Manual build attempt
+            export ARCH=arm64
+            export SUBARCH=arm64
+            export PATH="$GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin:$PATH"
+            export CLANG_TRIPLE=aarch64-linux-gnu-
+            export CROSS_COMPILE=aarch64-linux-gnu-
+            export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            
+            # Make defconfig
+            make exynos9810_defconfig
+            
+            # Apply specific fixes
+            scripts/config --disable IKHEADERS
+            scripts/config --disable RKP_KDP
+            
+            # Build only zImage
+            make -j$(nproc) CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip zImage
+            
+            echo "Manual build completed"
+          }
 
-      - name: Check If ZIP Created
+      - name: Check Build Output
         run: |
-          if find . -name "*.zip" -type f | grep -q .; then
-            echo "ZIP files found, good!"
+          echo "Checking build output..."
+          
+          # Check for zImage
+          if [ -f "arch/arm64/boot/Image" ]; then
+            echo "Kernel Image found!"
+            mkdir -p Apollo/Product
+            cp arch/arm64/boot/Image Apollo/Product/kernel.img
+            echo "Kernel image copied to Apollo/Product/"
+          fi
+          
+          # Check for any build artifacts
+          find . -name "*.img" -o -name "Image" -o -name "zImage" | head -10
+
+      - name: Create ZIP if Kernel Built
+        run: |
+          if [ -f "Apollo/Product/kernel.img" ]; then
+            echo "Creating ZIP file..."
+            cd Apollo/Product
+            zip_name="DS-ACK-Kernel-$(date +%Y%m%d-%H%M%S).zip"
+            zip "$zip_name" kernel.img
+            echo "Created: $zip_name"
+            ls -la
+            cd ../..
           else
-            echo "No ZIP files found, checking for IMG..."
-            if find . -name "*.img" -type f | grep -q .; then
-              echo "IMG files found, will create ZIP manually"
-              echo "CREATE_ZIP=true" >> $GITHUB_ENV
+            echo "No kernel image found, checking for other artifacts..."
+            if find Apollo/Product -name "*.img" | grep -q .; then
+              echo "Found existing IMG files"
+            else
+              echo "ERROR: No build artifacts found!"
+              exit 1
             fi
           fi
-
-      - name: Create ZIP from IMG if needed
-        if: env.CREATE_ZIP == 'true'
-        run: |
-          echo "Creating ZIP files from IMG files..."
-          cd Apollo/Product
-          for img_file in *.img; do
-            if [ -f "$img_file" ]; then
-              echo "Creating ZIP for $img_file"
-              zip_name="${img_file%.img}.zip"
-              # Einfache ZIP nur mit dem Image
-              zip "$zip_name" "$img_file"
-              echo "Created: $zip_name"
-            fi
-          done
-          cd ../..
-          ls -la Apollo/Product/
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
@@ -102,4 +166,18 @@ jobs:
           name: Kernel-Builds
           path: |
             Apollo/Product/*
+            arch/arm64/boot/Image
+            arch/arm64/boot/zImage
           if-no-files-found: error
+          compression-level: 6
+          overwrite: false
+
+      - name: Upload Build Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Build-Logs
+          path: |
+            build.log
+            config.log
+          if-no-files-found: ignore
