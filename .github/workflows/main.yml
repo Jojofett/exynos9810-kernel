@@ -5,7 +5,7 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout Kernel Source
@@ -19,8 +19,9 @@ jobs:
           if [ -f .gitmodules ]; then
             echo "Checking .gitmodules configuration..."
             if grep -q 'KernelSU-Next' .gitmodules; then
-              echo "Found KernelSU-Next in .gitmodules, checking URL..."
+              echo "Found KernelSU-Next in .gitmodules, removing..."
               sed -i '/\[submodule "KernelSU-Next"\]/,/^\[/d' .gitmodules
+              rm -rf KernelSU-Next 2>/dev/null || true
             fi
           fi
 
@@ -30,7 +31,8 @@ jobs:
           sudo apt install -y zstd git gnupg flex bison build-essential zip curl \
           zlib1g-dev libc6-dev-i386 x11proto-core-dev libx11-dev lib32z1-dev \
           libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
-          python-dev-is-python3 bsdiff wget clang clang-tools gcc lld libncurses-dev
+          python3-dev-is-python3 bsdiff wget clang clang-tools gcc lld libncurses-dev \
+          gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libssl-dev bc
 
       - name: Download and Extract Clang Toolchain
         run: |
@@ -54,130 +56,179 @@ jobs:
           fi
           rm clang.tar.gz
 
-      - name: Prepare Kernel Source
+      - name: Apply RKP Fixes
         run: |
-          # Set up build environment
+          echo "Applying RKP fixes..."
+          
+          # Fix 1: Create dummy RKP header
+          mkdir -p include/linux
+          cat > include/linux/rkp.h << 'EOF'
+          #ifndef _LINUX_RKP_H
+          #define _LINUX_RKP_H
+          
+          #include <linux/types.h>
+          
+          #ifdef CONFIG_RKP_KDP
+          void *rkp_ro_alloc(void);
+          void *rkp_ro_alloc_phys(void);
+          #else
+          static inline void *rkp_ro_alloc(void) { return NULL; }
+          static inline void *rkp_ro_alloc_phys(void) { return NULL; }
+          #endif
+          
+          #ifndef CONFIG_RKP
+          static inline bool rkp_is_pg_dbl_mapped(u64 pte) { return false; }
+          static inline bool rkp_is_pg_protected(u64 pte) { return false; }
+          
+          #define RKP_WRITE_PGT3 0
+          #define RKP_WRITE_PGT2 0
+          #define RKP_WRITE_PGT1 0
+          #define UH_APP_RKP 0
+          #define RKP_CMD_ID_GET_RKP_GET_RO_BIT 0
+          #endif
+          
+          #endif
+          EOF
+          
+          # Fix 2: Patch pgtable.h to handle missing RKP functions
+          sed -i '/#include <asm\/pgtable-hwdef.h>/a\
+          #ifndef CONFIG_RKP\
+          static inline bool rkp_is_pg_dbl_mapped(u64 pte) { return false; }\
+          static inline bool rkp_is_pg_protected(u64 pte) { return false; }\
+          #define RKP_WRITE_PGT3 0\
+          #define RKP_WRITE_PGT2 0\
+          #define RKP_WRITE_PGT1 0\
+          #define UH_APP_RKP 0\
+          #endif' arch/arm64/include/asm/pgtable.h
+          
+          # Fix 3: Patch security.h
+          sed -i '/extern u8 rkp_get_usm_block(void);/a\
+          #ifndef CONFIG_RKP\
+          static inline bool rkp_is_pg_protected(u64 addr) { return false; }\
+          #endif' include/linux/security.h
+          
+          # Fix 4: Create dummy uh.elf
+          mkdir -p init
+          echo "Creating dummy uh.elf file..."
+          dd if=/dev/zero of=init/uh.elf bs=1024 count=1 2>/dev/null || true
+          
+          echo "RKP fixes applied"
+
+      - name: Fix Build Configuration
+        run: |
+          echo "Fixing build configuration..."
+          
+          # Make sure build tools are available
+          touch buildtools
           chmod +x apollo.sh
           
-          # Clean previous builds
-          make clean || true
-          make mrproper || true
+          # Clean any previous builds
+          make clean 2>/dev/null || true
+          make mrproper 2>/dev/null || true
           
-          # Generate missing files
-          echo "Preparing kernel source..."
-          
-          # Create dummy uh.elf file if it doesn't exist
-          if [ ! -f "init/uh.elf" ]; then
-            echo "Creating dummy uh.elf file..."
-            mkdir -p init
-            dd if=/dev/zero of=init/uh.elf bs=1k count=1
+          # Fix init/main.c syntax error if it exists
+          if grep -q "cred.usage_cred         = 0;'" init/main.c 2>/dev/null; then
+            echo "Fixing syntax error in init/main.c..."
+            sed -i "s/cred\.usage_cred         = 0;' init\/main\.c/cred.usage_cred         = 0;/" init/main.c
           fi
-          
-          # Check for missing headers
-          echo "Checking for missing headers..."
 
-      - name: Build Kernel with Workarounds
-        id: build_step
+      - name: Build with GCC (Primary Attempt)
+        id: build_gcc
         continue-on-error: true
         run: |
-          echo "Attempting to build kernel with workarounds..."
+          echo "Attempting build with GCC (more compatible with kernel 4.9)"
+          export PATH="/usr/bin:$PATH"
           
-          # First, let's try to fix the rkp_ro_alloc_phys issue
-          # This function might be defined elsewhere - let's check
-          if ! grep -r "rkp_ro_alloc_phys" include/linux/rkp.h >/dev/null 2>&1; then
-            echo "Adding missing rkp_ro_alloc_phys declaration..."
-            echo "#ifndef _LINUX_RKP_H" > temp_rkp.h
-            echo "#define _LINUX_RKP_H" >> temp_rkp.h
-            echo "#ifdef CONFIG_RKP_KDP" >> temp_rkp.h
-            echo "void *rkp_ro_alloc(void);" >> temp_rkp.h
-            echo "void *rkp_ro_alloc_phys(void);" >> temp_rkp.h
-            echo "#endif /* CONFIG_RKP_KDP */" >> temp_rkp.h
-            echo "#endif /* _LINUX_RKP_H */" >> temp_rkp.h
-            sudo mv temp_rkp.h include/linux/rkp.h 2>/dev/null || true
-          fi
-          
-          # Try to build with simplified configuration first
-          echo "Generating minimal configuration..."
-          
-          # Use the script but skip interactive parts
-          echo "Running build script with automated inputs..."
-          printf "1\n3\n1\nn\ny\ny" | ./apollo.sh || {
-            echo "First build attempt failed, trying manual build..."
-            
-            # Manual build attempt
-            export ARCH=arm64
-            export SUBARCH=arm64
-            export PATH="$GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin:$PATH"
-            export CLANG_TRIPLE=aarch64-linux-gnu-
-            export CROSS_COMPILE=aarch64-linux-gnu-
-            export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-            
-            # Make defconfig
-            make exynos9810_defconfig
-            
-            # Apply specific fixes
-            scripts/config --disable IKHEADERS
-            scripts/config --disable RKP_KDP
-            
-            # Build only zImage
-            make -j$(nproc) CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip zImage
-            
-            echo "Manual build completed"
+          # Try with GCC using the script
+          printf "1\n1\n1\nn\ny\ny" | ./apollo.sh || {
+            echo "GCC build failed, will try Clang next"
+            exit 1
           }
 
-      - name: Check Build Output
+      - name: Build with Clang (Fallback)
+        if: steps.build_gcc.outcome == 'failure'
         run: |
-          echo "Checking build output..."
+          echo "Attempting build with Clang"
           
-          # Check for zImage
+          # Apply additional Clang-specific fixes
+          export PATH="$GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin:$PATH"
+          
+          # Disable problematic configs for Clang
+          ./scripts/config --disable IKHEADERS 2>/dev/null || true
+          ./scripts/config --disable RKP_KDP 2>/dev/null || true
+          ./scripts/config --disable RKP 2>/dev/null || true
+          
+          # Set environment for Clang
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export CLANG_TRIPLE=aarch64-linux-gnu-
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          
+          # Try to build using the script
+          printf "1\n3\n1\nn\ny\ny" | ./apollo.sh
+
+      - name: Check and Package Build Output
+        run: |
+          echo "Checking build artifacts..."
+          mkdir -p Apollo/Product
+          
+          # Check for different possible kernel image locations
           if [ -f "arch/arm64/boot/Image" ]; then
-            echo "Kernel Image found!"
-            mkdir -p Apollo/Product
+            echo "Found Image, copying to Apollo/Product/"
             cp arch/arm64/boot/Image Apollo/Product/kernel.img
-            echo "Kernel image copied to Apollo/Product/"
+          elif [ -f "arch/arm64/boot/Image.gz" ]; then
+            echo "Found compressed Image, copying..."
+            cp arch/arm64/boot/Image.gz Apollo/Product/kernel.img
+          elif [ -f "arch/arm64/boot/zImage" ]; then
+            echo "Found zImage, copying..."
+            cp arch/arm64/boot/zImage Apollo/Product/kernel.img
           fi
           
-          # Check for any build artifacts
-          find . -name "*.img" -o -name "Image" -o -name "zImage" | head -10
-
-      - name: Create ZIP if Kernel Built
-        run: |
-          if [ -f "Apollo/Product/kernel.img" ]; then
-            echo "Creating ZIP file..."
+          # Check if any build artifacts were created
+          if ls Apollo/Product/*.img 1> /dev/null 2>&1; then
+            echo "Kernel image found!"
             cd Apollo/Product
             zip_name="DS-ACK-Kernel-$(date +%Y%m%d-%H%M%S).zip"
-            zip "$zip_name" kernel.img
-            echo "Created: $zip_name"
+            echo "Creating ZIP: $zip_name"
+            zip -q "$zip_name" *.img
             ls -la
             cd ../..
           else
-            echo "No kernel image found, checking for other artifacts..."
-            if find Apollo/Product -name "*.img" | grep -q .; then
-              echo "Found existing IMG files"
-            else
-              echo "ERROR: No build artifacts found!"
-              exit 1
-            fi
+            echo "ERROR: No kernel image found!"
+            
+            # Try to find any image files
+            echo "Searching for image files..."
+            find . -name "*.img" -o -name "Image*" -o -name "zImage" | head -20
+            
+            # Check build logs
+            echo "Recent build output:"
+            tail -100 build.log 2>/dev/null || echo "No build.log found"
+            
+            exit 1
           fi
 
-      - name: Upload Artifacts
+      - name: Upload Kernel Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Kernel-Builds
+          name: Kernel-Build
           path: |
-            Apollo/Product/*
+            Apollo/Product/*.zip
+            Apollo/Product/*.img
             arch/arm64/boot/Image
             arch/arm64/boot/zImage
           if-no-files-found: error
           compression-level: 6
-          overwrite: false
+          retention-days: 7
 
-      - name: Upload Build Logs on Failure
-        if: failure()
+      - name: Upload Build Logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Build-Logs
           path: |
             build.log
             config.log
+            scripts/config.log
           if-no-files-found: ignore
+          retention-days: 7
