@@ -31,7 +31,7 @@ jobs:
           sudo apt install -y zstd git gnupg flex bison build-essential zip curl \
           zlib1g-dev libc6-dev-i386 x11proto-core-dev libx11-dev lib32z1-dev \
           libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
-          python3-dev-is-python3 bsdiff wget clang clang-tools gcc lld libncurses-dev \
+          python3-dev bsdiff wget clang clang-tools gcc lld libncurses-dev \
           gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libssl-dev bc
 
       - name: Download and Extract Clang Toolchain
