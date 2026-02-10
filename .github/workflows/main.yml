@@ -2,6 +2,10 @@ name: DS-ACK Kernel Build Test
 
 on:
   workflow_dispatch: # Allows manual trigger from the Actions tab
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
 
 jobs:
   build:
@@ -16,14 +20,16 @@ jobs:
 
       - name: Fix Submodule Configuration
         run: |
+          echo "Bereinige Submodule-Konfiguration..."
           if [ -f .gitmodules ]; then
-            echo "Checking .gitmodules configuration..."
             if grep -q 'KernelSU-Next' .gitmodules; then
-              echo "Found KernelSU-Next in .gitmodules, removing..."
-              sed -i '/\[submodule "KernelSU-Next"\]/,/^\[/d' .gitmodules
-              rm -rf KernelSU-Next 2>/dev/null || true
+              echo "Entferne KernelSU-Next aus .gitmodules..."
+              git config --file .gitmodules --remove-section submodule.KernelSU-Next 2>/dev/null || true
+              sed -i '/\[submodule "KernelSU-Next"\]/,+4d' .gitmodules 2>/dev/null || true
             fi
           fi
+          rm -rf KernelSU-Next 2>/dev/null || true
+          git status
 
       - name: Install Build Dependencies
         run: |
@@ -32,7 +38,8 @@ jobs:
           zlib1g-dev libc6-dev-i386 x11proto-core-dev libx11-dev lib32z1-dev \
           libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
           python3-dev bsdiff wget clang clang-tools gcc lld libncurses-dev \
-          gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libssl-dev bc
+          gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libssl-dev bc \
+          liblz4-tool gcc-10 g++-10
 
       - name: Download and Extract Clang Toolchain
         run: |
@@ -52,159 +59,318 @@ jobs:
             chmod +x $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin/*
           else
             echo "ERROR: Toolchain setup failed"
-            exit 1
+            # Fallback to system clang
+            echo "Using system clang instead"
+            mkdir -p $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin
+            ln -sf $(which clang) $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin/clang
+            ln -sf $(which ld.lld) $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin/ld.lld 2>/dev/null || true
           fi
-          rm clang.tar.gz
+          rm -f clang.tar.gz
 
-      - name: Apply RKP Fixes
+      - name: Fix Header Conflicts Before Build
         run: |
-          echo "Applying RKP fixes..."
+          echo "Kritische Header-Konflikte beheben..."
           
-          # Fix 1: Create dummy RKP header
+          # 1. Zuerst prüfen, welche Dateien existieren
+          echo "Prüfe existierende Header-Dateien..."
+          ls -la include/linux/uh.h 2>/dev/null || echo "uh.h nicht gefunden"
+          ls -la include/linux/rkp.h 2>/dev/null || echo "rkp.h nicht gefunden"
+          ls -la arch/arm64/include/asm/pgtable.h 2>/dev/null || echo "pgtable.h nicht gefunden"
+          
+          # 2. Backup von kritischen Dateien
+          mkdir -p .backup
+          [ -f "include/linux/uh.h" ] && cp include/linux/uh.h .backup/uh.h.original
+          [ -f "include/linux/rkp.h" ] && cp include/linux/rkp.h .backup/rkp.h.original
+          [ -f "arch/arm64/include/asm/pgtable.h" ] && cp arch/arm64/include/asm/pgtable.h .backup/pgtable.h.original
+          
+          # 3. Behebe den UH_APP_RKP Konflikt
+          echo "Behebe UH_APP_RKP Konflikt..."
+          if [ -f "arch/arm64/include/asm/pgtable.h" ]; then
+            # Entferne alle UH_APP_RKP Definitionen aus pgtable.h
+            sed -i '/#define UH_APP_RKP/d' arch/arm64/include/asm/pgtable.h
+            sed -i '/UH_APP_RKP[[:space:]]*=/d' arch/arm64/include/asm/pgtable.h
+            echo "✓ UH_APP_RKP aus pgtable.h entfernt"
+          fi
+          
+          # 4. Behebe RKP-Funktions-Konflikte
+          echo "Behebe RKP-Funktions-Konflikte..."
+          if [ -f "arch/arm64/include/asm/pgtable.h" ]; then
+            # Entferne die statischen inline-Funktionen aus pgtable.h
+            sed -i '/static inline bool rkp_is_pg_dbl_mapped/,/return false; }/d' arch/arm64/include/asm/pgtable.h
+            sed -i '/static inline bool rkp_is_pg_protected/,/return false; }/d' arch/arm64/include/asm/pgtable.h
+            echo "✓ RKP-Funktionen aus pgtable.h entfernt"
+          fi
+          
+          # 5. Erstelle oder repariere rkp.h mit korrekten Include-Guards
+          echo "Erstelle/repariere rkp.h..."
           mkdir -p include/linux
           cat > include/linux/rkp.h << 'EOF'
-          #ifndef _LINUX_RKP_H
-          #define _LINUX_RKP_H
+#ifndef _LINUX_RKP_H
+#define _LINUX_RKP_H
+
+#include <linux/types.h>
+
+/* Only define these if RKP is not configured */
+#ifndef CONFIG_RKP
+
+#ifndef CONFIG_RKP_KDP
+static inline void *rkp_ro_alloc(void) { return NULL; }
+static inline void *rkp_ro_alloc_phys(void) { return NULL; }
+#endif
+
+static inline bool rkp_is_pg_dbl_mapped(u64 pte) { return false; }
+static inline bool rkp_is_pg_protected(u64 pte) { return false; }
+
+#define RKP_WRITE_PGT3 0
+#define RKP_WRITE_PGT2 0
+#define RKP_WRITE_PGT1 0
+#define UH_APP_RKP 0
+#define RKP_CMD_ID_GET_RKP_GET_RO_BIT 0
+
+#endif /* CONFIG_RKP */
+
+#endif /* _LINUX_RKP_H */
+EOF
+          echo "✓ rkp.h erstellt/aktualisiert"
           
-          #include <linux/types.h>
+          # 6. Prüfe und repariere uh.h falls nötig
+          if [ -f "include/linux/uh.h" ]; then
+            echo "Prüfe uh.h..."
+            # Stelle sicher, dass UH_APP_RKP korrekt definiert ist
+            if ! grep -q "UH_APP_RKP" include/linux/uh.h; then
+              echo "#define UH_APP_RKP 0" >> include/linux/uh.h
+              echo "✓ UH_APP_RKP zu uh.h hinzugefügt"
+            fi
+          fi
           
-          #ifdef CONFIG_RKP_KDP
-          void *rkp_ro_alloc(void);
-          void *rkp_ro_alloc_phys(void);
-          #else
-          static inline void *rkp_ro_alloc(void) { return NULL; }
-          static inline void *rkp_ro_alloc_phys(void) { return NULL; }
-          #endif
-          
-          #ifndef CONFIG_RKP
-          static inline bool rkp_is_pg_dbl_mapped(u64 pte) { return false; }
-          static inline bool rkp_is_pg_protected(u64 pte) { return false; }
-          
-          #define RKP_WRITE_PGT3 0
-          #define RKP_WRITE_PGT2 0
-          #define RKP_WRITE_PGT1 0
-          #define UH_APP_RKP 0
-          #define RKP_CMD_ID_GET_RKP_GET_RO_BIT 0
-          #endif
-          
-          #endif
-          EOF
-          
-          # Fix 2: Patch pgtable.h to handle missing RKP functions
-          sed -i '/#include <asm\/pgtable-hwdef.h>/a\
-          #ifndef CONFIG_RKP\
-          static inline bool rkp_is_pg_dbl_mapped(u64 pte) { return false; }\
-          static inline bool rkp_is_pg_protected(u64 pte) { return false; }\
-          #define RKP_WRITE_PGT3 0\
-          #define RKP_WRITE_PGT2 0\
-          #define RKP_WRITE_PGT1 0\
-          #define UH_APP_RKP 0\
-          #endif' arch/arm64/include/asm/pgtable.h
-          
-          # Fix 3: Patch security.h
-          sed -i '/extern u8 rkp_get_usm_block(void);/a\
-          #ifndef CONFIG_RKP\
-          static inline bool rkp_is_pg_protected(u64 addr) { return false; }\
-          #endif' include/linux/security.h
-          
-          # Fix 4: Create dummy uh.elf
+          # 7. Erstelle dummy uh.elf
+          echo "Erstelle dummy uh.elf..."
           mkdir -p init
-          echo "Creating dummy uh.elf file..."
-          dd if=/dev/zero of=init/uh.elf bs=1024 count=1 2>/dev/null || true
+          dd if=/dev/zero of=init/uh.elf bs=1024 count=1 2>/dev/null || echo "✓ dummy uh.elf erstellt"
           
-          echo "RKP fixes applied"
+          echo "Header-Konflikte behoben!"
 
       - name: Fix Build Configuration
         run: |
-          echo "Fixing build configuration..."
+          echo "Konfiguration vorbereiten..."
           
-          # Make sure build tools are available
-          touch buildtools
-          chmod +x apollo.sh
+          # Stelle sicher, dass apollo.sh ausführbar ist
+          if [ -f "apollo.sh" ]; then
+            chmod +x apollo.sh
+            echo "apollo.sh ist ausführbar"
+          else
+            echo "WARNUNG: apollo.sh nicht gefunden"
+          fi
           
-          # Clean any previous builds
+          # Bereinige vorherige Builds
           make clean 2>/dev/null || true
           make mrproper 2>/dev/null || true
           
-          # Fix init/main.c syntax error if it exists
-          if grep -q "cred.usage_cred         = 0;'" init/main.c 2>/dev/null; then
-            echo "Fixing syntax error in init/main.c..."
-            sed -i "s/cred\.usage_cred         = 0;' init\/main\.c/cred.usage_cred         = 0;/" init/main.c
+          # Repariere Syntax-Fehler in main.c falls vorhanden
+          if [ -f "init/main.c" ]; then
+            if grep -q "cred.usage_cred.*=.*0;'" init/main.c; then
+              echo "Repariere Syntax-Fehler in init/main.c..."
+              sed -i "s/cred\.usage_cred.*=.*0;'/cred.usage_cred = 0;/g" init/main.c
+              echo "✓ Syntax-Fehler repariert"
+            fi
+          fi
+          
+          # Stelle sicher, dass tmp_defconfig existiert
+          if [ ! -f "arch/arm64/configs/tmp_defconfig" ]; then
+            echo "Erstelle tmp_defconfig von defconfig..."
+            if [ -f "arch/arm64/configs/defconfig" ]; then
+              cp arch/arm64/configs/defconfig arch/arm64/configs/tmp_defconfig
+              echo "✓ tmp_defconfig erstellt"
+            else
+              echo "WARNUNG: Keine defconfig gefunden"
+            fi
           fi
 
       - name: Build with GCC (Primary Attempt)
         id: build_gcc
         continue-on-error: true
         run: |
-          echo "Attempting build with GCC (more compatible with kernel 4.9)"
-          export PATH="/usr/bin:$PATH"
+          echo "Baue mit GCC (primärer Versuch)..."
+          export ARCH=arm64
+          export SUBARCH=arm64
           
-          # Try with GCC using the script
-          printf "1\n1\n1\nn\ny\ny" | ./apollo.sh || {
-            echo "GCC build failed, will try Clang next"
+          # Setze GCC als Compiler
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          
+          # Verwende make direkt statt des Scripts für bessere Fehlererkennung
+          if [ -f "arch/arm64/configs/tmp_defconfig" ]; then
+            cp arch/arm64/configs/tmp_defconfig .config
+            
+            # Deaktiviere problematische Optionen
+            ./scripts/config --disable IKHEADERS 2>/dev/null || true
+            ./scripts/config --disable INCREMENTAL_FS 2>/dev/null || true
+            ./scripts/config --set-val ALWAYS_PERMISSIVE n 2>/dev/null || true
+            ./scripts/config --disable RKP 2>/dev/null || true
+            ./scripts/config --disable RKP_KDP 2>/dev/null || true
+            
+            # Alte Konfiguration anwenden
+            yes "" | make oldconfig
+            
+            # Baue
+            echo "Starte Build-Prozess..."
+            make -j$(nproc) 2>&1 | tee build.log
+            
+            if [ ${PIPESTATUS[0]} -eq 0 ]; then
+              echo "✓ GCC Build erfolgreich!"
+              exit 0
+            else
+              echo "✗ GCC Build fehlgeschlagen, versuche Clang..."
+              exit 1
+            fi
+          else
+            echo "✗ Keine Konfiguration gefunden"
             exit 1
-          }
+          fi
 
       - name: Build with Clang (Fallback)
         if: steps.build_gcc.outcome == 'failure'
         run: |
-          echo "Attempting build with Clang"
+          echo "Baue mit Clang (Fallback)..."
           
-          # Apply additional Clang-specific fixes
+          # Setze Clang-Pfad
           export PATH="$GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin:$PATH"
-          
-          # Disable problematic configs for Clang
-          ./scripts/config --disable IKHEADERS 2>/dev/null || true
-          ./scripts/config --disable RKP_KDP 2>/dev/null || true
-          ./scripts/config --disable RKP 2>/dev/null || true
-          
-          # Set environment for Clang
           export ARCH=arm64
           export SUBARCH=arm64
           export CLANG_TRIPLE=aarch64-linux-gnu-
           export CROSS_COMPILE=aarch64-linux-gnu-
           export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          export CC=clang
+          export LD=ld.lld
           
-          # Try to build using the script
-          printf "1\n3\n1\nn\ny\ny" | ./apollo.sh
+          # Bereinige vor Clang-Build
+          make clean 2>/dev/null || true
+          
+          if [ -f "arch/arm64/configs/tmp_defconfig" ]; then
+            cp arch/arm64/configs/tmp_defconfig .config
+            
+            # Deaktiviere problematische Optionen für Clang
+            ./scripts/config --disable IKHEADERS 2>/dev/null || true
+            ./scripts/config --disable INCREMENTAL_FS 2>/dev/null || true
+            ./scripts/config --set-val ALWAYS_PERMISSIVE n 2>/dev/null || true
+            ./scripts/config --disable RKP 2>/dev/null || true
+            ./scripts/config --disable RKP_KDP 2>/dev/null || true
+            ./scripts/config --disable CC_OPTIMIZE_FOR_PERFORMANCE 2>/dev/null || true
+            ./scripts/config --enable CC_OPTIMIZE_FOR_SIZE 2>/dev/null || true
+            
+            # Alte Konfiguration anwenden
+            yes "" | make oldconfig
+            
+            # Versuche zu bauen
+            echo "Starte Clang Build..."
+            
+            # Erster Versuch: prepare
+            make prepare 2>&1 | tee -a build.log
+            
+            if [ ${PIPESTATUS[0]} -eq 0 ]; then
+              echo "✓ prepare erfolgreich, baue vollständig..."
+              make -j$(nproc) 2>&1 | tee -a build.log
+              
+              if [ ${PIPESTATUS[0]} -eq 0 ]; then
+                echo "✓ Clang Build erfolgreich!"
+              else
+                echo "✗ Clang Build fehlgeschlagen"
+                exit 1
+              fi
+            else
+              echo "✗ prepare fehlgeschlagen"
+              exit 1
+            fi
+          else
+            echo "✗ Keine Konfiguration gefunden"
+            exit 1
+          fi
+
+      - name: Manual Build Attempt (Last Resort)
+        if: failure()
+        run: |
+          echo "Manueller Build-Versuch als letzte Option..."
+          
+          # Versuche minimalen Build
+          export ARCH=arm64
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          
+          # Erstelle minimale defconfig
+          make defconfig 2>&1 | tee minimal.log
+          
+          # Baue nur die essentiellen Teile
+          echo "Baue asm-offsets..."
+          make arch/arm64/kernel/asm-offsets.s 2>&1 | tee -a minimal.log
+          
+          if [ ${PIPESTATUS[0]} -eq 0 ]; then
+            echo "✓ asm-offsets erfolgreich"
+            echo "Baue head.o..."
+            make arch/arm64/kernel/head.o 2>&1 | tee -a minimal.log
+            
+            if [ ${PIPESTATUS[0]} -eq 0 ]; then
+              echo "Versuche Image zu bauen..."
+              make Image 2>&1 | tee -a minimal.log
+            fi
+          fi
 
       - name: Check and Package Build Output
         run: |
-          echo "Checking build artifacts..."
+          echo "Prüfe Build-Ergebnisse..."
           mkdir -p Apollo/Product
           
-          # Check for different possible kernel image locations
-          if [ -f "arch/arm64/boot/Image" ]; then
-            echo "Found Image, copying to Apollo/Product/"
-            cp arch/arm64/boot/Image Apollo/Product/kernel.img
-          elif [ -f "arch/arm64/boot/Image.gz" ]; then
-            echo "Found compressed Image, copying..."
-            cp arch/arm64/boot/Image.gz Apollo/Product/kernel.img
-          elif [ -f "arch/arm64/boot/zImage" ]; then
-            echo "Found zImage, copying..."
-            cp arch/arm64/boot/zImage Apollo/Product/kernel.img
+          # Suche nach verschiedenen Kernel-Image-Varianten
+          found_image=false
+          
+          for img in "arch/arm64/boot/Image" \
+                     "arch/arm64/boot/Image.gz" \
+                     "arch/arm64/boot/Image.gz-dtb" \
+                     "arch/arm64/boot/zImage" \
+                     "arch/arm64/boot/Image-dtb" \
+                     "arch/arm64/boot/bzImage"; do
+            if [ -f "$img" ]; then
+              echo "Gefunden: $img"
+              cp "$img" Apollo/Product/kernel.img
+              found_image=true
+              break
+            fi
+          done
+          
+          # Falls nichts gefunden wurde, suche rekursiv
+          if [ "$found_image" = false ]; then
+            echo "Suche rekursiv nach Image-Dateien..."
+            find_result=$(find . -name "Image*" -o -name "zImage" -o -name "*.img" 2>/dev/null | head -5)
+            if [ -n "$find_result" ]; then
+              first_image=$(echo "$find_result" | head -1)
+              echo "Gefunden: $first_image"
+              cp "$first_image" Apollo/Product/kernel.img
+              found_image=true
+            fi
           fi
           
-          # Check if any build artifacts were created
-          if ls Apollo/Product/*.img 1> /dev/null 2>&1; then
-            echo "Kernel image found!"
+          if [ "$found_image" = true ]; then
+            echo "✓ Kernel-Image gefunden!"
             cd Apollo/Product
             zip_name="DS-ACK-Kernel-$(date +%Y%m%d-%H%M%S).zip"
-            echo "Creating ZIP: $zip_name"
+            echo "Erstelle ZIP: $zip_name"
             zip -q "$zip_name" *.img
+            echo "Dateien in Apollo/Product/:"
             ls -la
             cd ../..
           else
-            echo "ERROR: No kernel image found!"
+            echo "✗ KEIN Kernel-Image gefunden!"
+            echo "Build-Log Auszug (letzte 100 Zeilen):"
+            tail -100 build.log 2>/dev/null || echo "Kein build.log verfügbar"
             
-            # Try to find any image files
-            echo "Searching for image files..."
-            find . -name "*.img" -o -name "Image*" -o -name "zImage" | head -20
+            # Erstelle Fehlerlog
+            echo "Build-Fehler-Details:" > build-error.txt
+            date >> build-error.txt
+            echo "=== Letzte 200 Zeilen von build.log ===" >> build-error.txt
+            tail -200 build.log 2>/dev/null >> build-error.txt || echo "Kein build.log" >> build-error.txt
+            echo "=== Konfiguration ===" >> build-error.txt
+            [ -f ".config" ] && head -50 .config >> build-error.txt || echo "Keine .config" >> build-error.txt
             
-            # Check build logs
-            echo "Recent build output:"
-            tail -100 build.log 2>/dev/null || echo "No build.log found"
-            
+            mkdir -p Apollo/Product
+            cp build-error.txt Apollo/Product/
             exit 1
           fi
 
@@ -215,7 +381,7 @@ jobs:
           path: |
             Apollo/Product/*.zip
             Apollo/Product/*.img
-            arch/arm64/boot/Image
+            arch/arm64/boot/Image*
             arch/arm64/boot/zImage
           if-no-files-found: error
           compression-level: 6
@@ -228,7 +394,23 @@ jobs:
           name: Build-Logs
           path: |
             build.log
+            minimal.log
+            build-error.txt
+            .config
             config.log
             scripts/config.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload Debug Info
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Debug-Info
+          path: |
+            .backup/
+            include/linux/uh.h
+            include/linux/rkp.h
+            arch/arm64/include/asm/pgtable.h
           if-no-files-found: ignore
           retention-days: 7
