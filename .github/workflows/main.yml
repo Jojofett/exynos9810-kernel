@@ -2,7 +2,7 @@ name: Build Kernel
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, duhan-(4.9.337) ]
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
@@ -19,27 +19,31 @@ jobs:
         submodules: recursive
 
     # ------------------------------------------------------------------
-    # 1. FIX SUBMODULES (especially KernelSU-Next if missing URL)
+    # FIX SUBMODULE KernelSU-Next (missing URL in .gitmodules)
     # ------------------------------------------------------------------
     - name: Repair KernelSU-Next submodule
       run: |
-        # If the directory exists but is not a proper git repo, remove it
-        if [ -d "KernelSU-Next" ] && [ ! -f "KernelSU-Next/.git" ]; then
-          echo "Removing invalid KernelSU-Next directory"
-          rm -rf KernelSU-Next
-        fi
-        # If .gitmodules references KernelSU-Next but has no URL, add a default (change to your actual URL)
+        # If .gitmodules references KernelSU-Next but has no URL, add a default.
+        # Replace the URL below with the correct one if you know it.
         if grep -q "KernelSU-Next" .gitmodules 2>/dev/null; then
           if ! git config --file .gitmodules submodule.KernelSU-Next.url > /dev/null; then
             echo "Adding missing URL for KernelSU-Next submodule"
+            # ⚠️ CHANGE THIS TO THE REAL URL ⚠️
             git config --file .gitmodules submodule.KernelSU-Next.url https://github.com/Jojofett/KernelSU-Next.git
           fi
         fi
-        git submodule sync --recursive
-        git submodule update --init --recursive --force
+
+        # Try to update submodules; if it fails, remove the directory as a fallback.
+        git submodule sync --recursive || true
+        git submodule update --init --recursive --force || {
+          echo "Failed to update submodules. Removing KernelSU-Next directory."
+          rm -rf KernelSU-Next
+          # Also remove the entry from .gitmodules to avoid future errors
+          git config --file .gitmodules --remove-section submodule.KernelSU-Next 2>/dev/null || true
+        }
 
     # ------------------------------------------------------------------
-    # 2. INSTALL DEPENDENCIES & TOOLCHAINS
+    # INSTALL DEPENDENCIES
     # ------------------------------------------------------------------
     - name: Install dependencies
       run: |
@@ -53,10 +57,8 @@ jobs:
 
     - name: Install cross-compilers
       run: |
-        # AArch64 (kernel) – provides aarch64-linux-gnu-ld.bfd
         sudo apt install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-        # ARM 32-bit (for uH, if needed)
-        sudo apt install -y gcc-arm-none-eabi binutils-arm-none-eabi
+        sudo apt install -y gcc-arm-none-eabi binutils-arm-none-eabi   # for uH (if needed)
 
     - name: Set up ccache
       uses: hendrikmuhs/ccache-action@v1.2
@@ -64,57 +66,52 @@ jobs:
         key: ${{ runner.os }}-kernel
 
     # ------------------------------------------------------------------
-    # 3. BUILD uH FIRMWARE (if source present)
-    #    Assumes uH source is in init/uh/ – adjust path if different.
+    # BUILD uH FIRMWARE (if source exists)
     # ------------------------------------------------------------------
     - name: Build uh.elf
       run: |
-        UH_SOURCE_DIR="init/uh"   # <-- change if your uH source is elsewhere
+        UH_SOURCE_DIR="init/uh"   # adjust if different
         if [ -f "$UH_SOURCE_DIR/Makefile" ]; then
           echo "Building uH firmware from $UH_SOURCE_DIR"
           make -C "$UH_SOURCE_DIR" CROSS_COMPILE=arm-none-eabi- CC=arm-none-eabi-gcc
-          # Locate the generated uh.elf (may be in build/ subfolder)
           UH_ELF=$(find "$UH_SOURCE_DIR" -name "uh.elf" | head -1)
           if [ -n "$UH_ELF" ]; then
             cp "$UH_ELF" init/
             echo "uh.elf copied to init/"
           else
-            echo "ERROR: uh.elf not generated. Check uH build logs."
+            echo "ERROR: uh.elf not generated. Check uH build."
             exit 1
           fi
         else
           echo "No uH source found at $UH_SOURCE_DIR. If uh.elf is required, ensure it is prebuilt."
-          if [ ! -f "init/uh.elf" ] && grep -q 'incbin.*uh.elf' init/_uh.S; then
+          if [ ! -f "init/uh.elf" ] && grep -q 'incbin.*uh.elf' init/_uh.S 2>/dev/null; then
             echo "WARNING: init/uh.elf is missing. Creating a dummy file to satisfy the build."
             touch init/uh.elf
           fi
         fi
 
     # ------------------------------------------------------------------
-    # 4. SET KERNEL BUILD ENVIRONMENT
-    #    Use GNU BFD linker (ld.bfd) to avoid vDSO errors with ld.lld.
+    # SET KERNEL BUILD ENVIRONMENT
     # ------------------------------------------------------------------
     - name: Set build environment
       run: |
         echo "ARCH=arm64" >> $GITHUB_ENV
         echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-        # Explicitly use GNU BFD linker (safe for Samsung kernels)
+        # Force GNU BFD linker (fixes vDSO error with ld.lld)
         echo "LD=aarch64-linux-gnu-ld.bfd" >> $GITHUB_ENV
-        # Enable ccache
         echo "/usr/lib/ccache" >> $GITHUB_PATH
 
     - name: Clean build directory
       run: make clean && make mrproper
 
     # ------------------------------------------------------------------
-    # 5. GENERATE DEFCONFIG – REPLACE WITH YOUR ACTUAL TARGET
-    #    Check arch/arm64/configs/ for the correct name (e.g., exynos9810_defconfig, a71_defconfig, etc.)
+    # GENERATE DEFCONFIG (adjust to your actual defconfig name)
     # ------------------------------------------------------------------
     - name: Generate defconfig
-      run: make exynos9810_defconfig   # <-- CHANGE THIS
+      run: make exynos9810_defconfig   # <-- CHANGE THIS if needed (e.g., a71_defconfig)
 
     # ------------------------------------------------------------------
-    # 6. DISABLE RKP (to fix rkp_ro_alloc_phys errors)
+    # DISABLE RKP (fixes rkp_ro_alloc_phys errors)
     # ------------------------------------------------------------------
     - name: Disable RKP
       run: |
@@ -124,15 +121,14 @@ jobs:
         make olddefconfig
 
     # ------------------------------------------------------------------
-    # 7. BUILD KERNEL IMAGE
-    #    Change the target (Image, zImage, Image.gz) based on your kernel.
+    # BUILD KERNEL IMAGE
     # ------------------------------------------------------------------
     - name: Build kernel
       run: |
-        make -j$(nproc) Image   # <-- CHANGE if needed (e.g., zImage)
+        make -j$(nproc) Image   # change to zImage/Image.gz if needed
 
     # ------------------------------------------------------------------
-    # 8. LOCATE AND PACKAGE KERNEL IMAGE
+    # PACKAGE KERNEL
     # ------------------------------------------------------------------
     - name: Check build artifacts
       run: |
