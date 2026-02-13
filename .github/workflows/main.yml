@@ -1,7 +1,7 @@
 name: DS-ACK Kernel Build Test
 
 on:
-  workflow_dispatch: # Allows manual trigger from the Actions tab
+  workflow_dispatch:
 
 jobs:
   build:
@@ -56,81 +56,13 @@ jobs:
           fi
           rm clang.tar.gz
 
-      - name: Apply RKP Fixes
+      # KEINE manuellen Patches mehr – der originale Quellcode bleibt unverändert
+      - name: Prepare Build Environment
         run: |
-          echo "Applying RKP fixes..."
-          
-          # Fix 1: Create dummy RKP header
-          mkdir -p include/linux
-          cat > include/linux/rkp.h << 'EOF'
-          #ifndef _LINUX_RKP_H
-          #define _LINUX_RKP_H
-          
-          #include <linux/types.h>
-          
-          #ifdef CONFIG_RKP_KDP
-          void *rkp_ro_alloc(void);
-          void *rkp_ro_alloc_phys(void);
-          #else
-          static inline void *rkp_ro_alloc(void) { return NULL; }
-          static inline void *rkp_ro_alloc_phys(void) { return NULL; }
-          #endif
-          
-          #ifndef CONFIG_RKP
-          static inline bool rkp_is_pg_dbl_mapped(u64 pte) { return false; }
-          static inline bool rkp_is_pg_protected(u64 pte) { return false; }
-          
-          #define RKP_WRITE_PGT3 0
-          #define RKP_WRITE_PGT2 0
-          #define RKP_WRITE_PGT1 0
-          #define UH_APP_RKP 0
-          #define RKP_CMD_ID_GET_RKP_GET_RO_BIT 0
-          #endif
-          
-          #endif
-          EOF
-          
-          # Fix 2: Patch pgtable.h to handle missing RKP functions
-          sed -i '/#include <asm\/pgtable-hwdef.h>/a\
-          #ifndef CONFIG_RKP\
-          static inline bool rkp_is_pg_dbl_mapped(u64 pte) { return false; }\
-          static inline bool rkp_is_pg_protected(u64 pte) { return false; }\
-          #define RKP_WRITE_PGT3 0\
-          #define RKP_WRITE_PGT2 0\
-          #define RKP_WRITE_PGT1 0\
-          #define UH_APP_RKP 0\
-          #endif' arch/arm64/include/asm/pgtable.h
-          
-          # Fix 3: Patch security.h
-          sed -i '/extern u8 rkp_get_usm_block(void);/a\
-          #ifndef CONFIG_RKP\
-          static inline bool rkp_is_pg_protected(u64 addr) { return false; }\
-          #endif' include/linux/security.h
-          
-          # Fix 4: Create dummy uh.elf
-          mkdir -p init
-          echo "Creating dummy uh.elf file..."
-          dd if=/dev/zero of=init/uh.elf bs=1024 count=1 2>/dev/null || true
-          
-          echo "RKP fixes applied"
-
-      - name: Fix Build Configuration
-        run: |
-          echo "Fixing build configuration..."
-          
-          # Make sure build tools are available
-          touch buildtools
-          chmod +x apollo.sh
-          
-          # Clean any previous builds
+          # Nur aufräumen, keine Patches
           make clean 2>/dev/null || true
           make mrproper 2>/dev/null || true
-          
-          # Fix init/main.c syntax error if it exists
-          if grep -q "cred.usage_cred         = 0;'" init/main.c 2>/dev/null; then
-            echo "Fixing syntax error in init/main.c..."
-            sed -i "s/cred\.usage_cred         = 0;' init\/main\.c/cred.usage_cred         = 0;/" init/main.c
-          fi
+          chmod +x apollo.sh
 
       - name: Build with GCC (Primary Attempt)
         id: build_gcc
@@ -150,15 +82,8 @@ jobs:
         run: |
           echo "Attempting build with Clang"
           
-          # Apply additional Clang-specific fixes
           export PATH="$GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin:$PATH"
           
-          # Disable problematic configs for Clang
-          ./scripts/config --disable IKHEADERS 2>/dev/null || true
-          ./scripts/config --disable RKP_KDP 2>/dev/null || true
-          ./scripts/config --disable RKP 2>/dev/null || true
-          
-          # Set environment for Clang
           export ARCH=arm64
           export SUBARCH=arm64
           export CLANG_TRIPLE=aarch64-linux-gnu-
