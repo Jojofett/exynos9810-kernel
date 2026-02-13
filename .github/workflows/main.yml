@@ -1,159 +1,174 @@
-name: DS-ACK Kernel Build Test
+name: Build Kernel
 
 on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout Kernel Source
-        uses: actions/checkout@v4
-        with:
-          submodules: false
-          fetch-depth: 0
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        submodules: recursive
 
-      - name: Fix Submodule Configuration
-        run: |
-          if [ -f .gitmodules ]; then
-            echo "Checking .gitmodules configuration..."
-            if grep -q 'KernelSU-Next' .gitmodules; then
-              echo "Found KernelSU-Next in .gitmodules, removing..."
-              sed -i '/\[submodule "KernelSU-Next"\]/,/^\[/d' .gitmodules
-              rm -rf KernelSU-Next 2>/dev/null || true
-            fi
+    # ------------------------------------------------------------------
+    # 1. FIX SUBMODULES (especially KernelSU-Next if missing URL)
+    # ------------------------------------------------------------------
+    - name: Repair KernelSU-Next submodule
+      run: |
+        # If the directory exists but is not a proper git repo, remove it
+        if [ -d "KernelSU-Next" ] && [ ! -f "KernelSU-Next/.git" ]; then
+          echo "Removing invalid KernelSU-Next directory"
+          rm -rf KernelSU-Next
+        fi
+        # If .gitmodules references KernelSU-Next but has no URL, add a default (change to your actual URL)
+        if grep -q "KernelSU-Next" .gitmodules 2>/dev/null; then
+          if ! git config --file .gitmodules submodule.KernelSU-Next.url > /dev/null; then
+            echo "Adding missing URL for KernelSU-Next submodule"
+            git config --file .gitmodules submodule.KernelSU-Next.url https://github.com/Jojofett/KernelSU-Next.git
           fi
+        fi
+        git submodule sync --recursive
+        git submodule update --init --recursive --force
 
-      - name: Install Build Dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y zstd git gnupg flex bison build-essential zip curl \
-          zlib1g-dev libc6-dev-i386 x11proto-core-dev libx11-dev lib32z1-dev \
-          libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig \
-          python3 bsdiff wget clang clang-tools gcc lld libncurses-dev \
-          gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libssl-dev bc
+    # ------------------------------------------------------------------
+    # 2. INSTALL DEPENDENCIES & TOOLCHAINS
+    # ------------------------------------------------------------------
+    - name: Install dependencies
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+          git gnupg gperf imagemagick lib32ncurses5-dev lib32readline-dev \
+          lib32z1-dev liblz4-tool libncurses5-dev libsdl1.2-dev libssl-dev \
+          libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools \
+          xsltproc zip zlib1g-dev unzip python3 python3-pip
 
-      - name: Download and Extract Clang Toolchain
-        run: |
-          mkdir -p $GITHUB_WORKSPACE/../compiler
-          echo "Downloading Clang r522817..."
-          curl -Lo clang.tar.gz https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/llvm-r522817/clang-r522817.tar.gz
-          echo "Extracting toolchain..."
-          tar -xzf clang.tar.gz -C $GITHUB_WORKSPACE/../compiler
-          
-          mkdir -p $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817
-          if [ "$(ls -A $GITHUB_WORKSPACE/../compiler)" ]; then
-              mv $GITHUB_WORKSPACE/../compiler/* $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/ 2>/dev/null || true
-          fi
-          
-          if [ -f "$GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin/ld.lld" ]; then
-            echo "Toolchain ready"
-            chmod +x $GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin/*
+    - name: Install cross-compilers
+      run: |
+        # AArch64 (kernel) – provides aarch64-linux-gnu-ld.bfd
+        sudo apt install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+        # ARM 32-bit (for uH, if needed)
+        sudo apt install -y gcc-arm-none-eabi binutils-arm-none-eabi
+
+    - name: Set up ccache
+      uses: hendrikmuhs/ccache-action@v1.2
+      with:
+        key: ${{ runner.os }}-kernel
+
+    # ------------------------------------------------------------------
+    # 3. BUILD uH FIRMWARE (if source present)
+    #    Assumes uH source is in init/uh/ – adjust path if different.
+    # ------------------------------------------------------------------
+    - name: Build uh.elf
+      run: |
+        UH_SOURCE_DIR="init/uh"   # <-- change if your uH source is elsewhere
+        if [ -f "$UH_SOURCE_DIR/Makefile" ]; then
+          echo "Building uH firmware from $UH_SOURCE_DIR"
+          make -C "$UH_SOURCE_DIR" CROSS_COMPILE=arm-none-eabi- CC=arm-none-eabi-gcc
+          # Locate the generated uh.elf (may be in build/ subfolder)
+          UH_ELF=$(find "$UH_SOURCE_DIR" -name "uh.elf" | head -1)
+          if [ -n "$UH_ELF" ]; then
+            cp "$UH_ELF" init/
+            echo "uh.elf copied to init/"
           else
-            echo "ERROR: Toolchain setup failed"
+            echo "ERROR: uh.elf not generated. Check uH build logs."
             exit 1
           fi
-          rm clang.tar.gz
-
-      # KEINE manuellen Patches mehr – der originale Quellcode bleibt unverändert
-      - name: Prepare Build Environment
-        run: |
-          # Nur aufräumen, keine Patches
-          make clean 2>/dev/null || true
-          make mrproper 2>/dev/null || true
-          chmod +x apollo.sh
-
-      - name: Build with GCC (Primary Attempt)
-        id: build_gcc
-        continue-on-error: true
-        run: |
-          echo "Attempting build with GCC (more compatible with kernel 4.9)"
-          export PATH="/usr/bin:$PATH"
-          
-          # Try with GCC using the script
-          printf "1\n1\n1\nn\ny\ny" | ./apollo.sh || {
-            echo "GCC build failed, will try Clang next"
-            exit 1
-          }
-
-      - name: Build with Clang (Fallback)
-        if: steps.build_gcc.outcome == 'failure'
-        run: |
-          echo "Attempting build with Clang"
-          
-          export PATH="$GITHUB_WORKSPACE/../compiler/clang-18.0.1-r522817/bin:$PATH"
-          
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export CLANG_TRIPLE=aarch64-linux-gnu-
-          export CROSS_COMPILE=aarch64-linux-gnu-
-          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
-          
-          # Try to build using the script
-          printf "1\n3\n1\nn\ny\ny" | ./apollo.sh
-
-      - name: Check and Package Build Output
-        run: |
-          echo "Checking build artifacts..."
-          mkdir -p Apollo/Product
-          
-          # Check for different possible kernel image locations
-          if [ -f "arch/arm64/boot/Image" ]; then
-            echo "Found Image, copying to Apollo/Product/"
-            cp arch/arm64/boot/Image Apollo/Product/kernel.img
-          elif [ -f "arch/arm64/boot/Image.gz" ]; then
-            echo "Found compressed Image, copying..."
-            cp arch/arm64/boot/Image.gz Apollo/Product/kernel.img
-          elif [ -f "arch/arm64/boot/zImage" ]; then
-            echo "Found zImage, copying..."
-            cp arch/arm64/boot/zImage Apollo/Product/kernel.img
+        else
+          echo "No uH source found at $UH_SOURCE_DIR. If uh.elf is required, ensure it is prebuilt."
+          if [ ! -f "init/uh.elf" ] && grep -q 'incbin.*uh.elf' init/_uh.S; then
+            echo "WARNING: init/uh.elf is missing. Creating a dummy file to satisfy the build."
+            touch init/uh.elf
           fi
-          
-          # Check if any build artifacts were created
-          if ls Apollo/Product/*.img 1> /dev/null 2>&1; then
-            echo "Kernel image found!"
-            cd Apollo/Product
-            zip_name="DS-ACK-Kernel-$(date +%Y%m%d-%H%M%S).zip"
-            echo "Creating ZIP: $zip_name"
-            zip -q "$zip_name" *.img
-            ls -la
-            cd ../..
-          else
-            echo "ERROR: No kernel image found!"
-            
-            # Try to find any image files
-            echo "Searching for image files..."
-            find . -name "*.img" -o -name "Image*" -o -name "zImage" | head -20
-            
-            # Check build logs
-            echo "Recent build output:"
-            tail -100 build.log 2>/dev/null || echo "No build.log found"
-            
-            exit 1
-          fi
+        fi
 
-      - name: Upload Kernel Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: Kernel-Build
-          path: |
-            Apollo/Product/*.zip
-            Apollo/Product/*.img
-            arch/arm64/boot/Image
-            arch/arm64/boot/zImage
-          if-no-files-found: error
-          compression-level: 6
-          retention-days: 7
+    # ------------------------------------------------------------------
+    # 4. SET KERNEL BUILD ENVIRONMENT
+    #    Use GNU BFD linker (ld.bfd) to avoid vDSO errors with ld.lld.
+    # ------------------------------------------------------------------
+    - name: Set build environment
+      run: |
+        echo "ARCH=arm64" >> $GITHUB_ENV
+        echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+        # Explicitly use GNU BFD linker (safe for Samsung kernels)
+        echo "LD=aarch64-linux-gnu-ld.bfd" >> $GITHUB_ENV
+        # Enable ccache
+        echo "/usr/lib/ccache" >> $GITHUB_PATH
 
-      - name: Upload Build Logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: Build-Logs
-          path: |
-            build.log
-            config.log
-            scripts/config.log
-          if-no-files-found: ignore
-          retention-days: 7
+    - name: Clean build directory
+      run: make clean && make mrproper
+
+    # ------------------------------------------------------------------
+    # 5. GENERATE DEFCONFIG – REPLACE WITH YOUR ACTUAL TARGET
+    #    Check arch/arm64/configs/ for the correct name (e.g., exynos9810_defconfig, a71_defconfig, etc.)
+    # ------------------------------------------------------------------
+    - name: Generate defconfig
+      run: make exynos9810_defconfig   # <-- CHANGE THIS
+
+    # ------------------------------------------------------------------
+    # 6. DISABLE RKP (to fix rkp_ro_alloc_phys errors)
+    # ------------------------------------------------------------------
+    - name: Disable RKP
+      run: |
+        scripts/config --file .config --undefine CONFIG_RKP
+        scripts/config --file .config --undefine CONFIG_SAMSUNG_RKP
+        scripts/config --file .config --set-val CONFIG_RKP n
+        make olddefconfig
+
+    # ------------------------------------------------------------------
+    # 7. BUILD KERNEL IMAGE
+    #    Change the target (Image, zImage, Image.gz) based on your kernel.
+    # ------------------------------------------------------------------
+    - name: Build kernel
+      run: |
+        make -j$(nproc) Image   # <-- CHANGE if needed (e.g., zImage)
+
+    # ------------------------------------------------------------------
+    # 8. LOCATE AND PACKAGE KERNEL IMAGE
+    # ------------------------------------------------------------------
+    - name: Check build artifacts
+      run: |
+        mkdir -p Apollo/Product
+        if [ -f "arch/arm64/boot/Image" ]; then
+          cp arch/arm64/boot/Image Apollo/Product/kernel.img
+        elif [ -f "arch/arm64/boot/Image.gz" ]; then
+          cp arch/arm64/boot/Image.gz Apollo/Product/kernel.img
+        elif [ -f "arch/arm64/boot/zImage" ]; then
+          cp arch/arm64/boot/zImage Apollo/Product/kernel.img
+        else
+          echo "ERROR: No kernel image found!"
+          find . -name "*.img" -o -name "Image*" -o -name "zImage" | head -20
+          exit 1
+        fi
+
+    - name: Package kernel
+      run: |
+        cd Apollo/Product
+        zip_name="DS-ACK-Kernel-$(date +%Y%m%d-%H%M%S).zip"
+        zip -q "$zip_name" kernel.img
+        echo "Created $zip_name"
+        cd ../..
+
+    - name: Upload kernel image
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-image
+        path: Apollo/Product/*.zip
+
+    - name: Upload build logs (if any)
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: Build-Logs
+        path: |
+          build.log
+          config.log
+          scripts/config.log
